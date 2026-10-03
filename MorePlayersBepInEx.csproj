@@ -3,7 +3,7 @@
     <TargetFramework>net6.0</TargetFramework>
     <AssemblyName>SupermarketMorePlayers</AssemblyName>
     <RootNamespace>SupermarketMorePlayers</RootNamespace>
-    <Nullable>enable</Nullable>
+    <Nullable>disable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -28,6 +28,9 @@
     </Reference>
     <Reference Include="Il2CppInterop.Runtime" Private="false">
       <HintPath>$(BepInExCoreDir)/Il2CppInterop.Runtime.dll</HintPath>
+    </Reference>
+    <Reference Include="Il2Cppmscorlib" Private="false">
+      <HintPath>$(BepInExInteropDir)/Il2Cppmscorlib.dll</HintPath>
     </Reference>
     <Reference Include="UnityEngine.CoreModule" Private="false">
       <HintPath>$(BepInExInteropDir)/UnityEngine.CoreModule.dll</HintPath>

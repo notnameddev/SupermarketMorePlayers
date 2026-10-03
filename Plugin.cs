@@ -32,13 +32,13 @@ public sealed class Plugin : BasePlugin
         "OnConnectedToMaster"
     };
 
-    private static ManualLogSource? s_log;
-    private static ConfigEntry<int>? s_maxPlayers;
-    private static ConfigEntry<bool>? s_patchSteamLobby;
-    private static ConfigEntry<bool>? s_shrinkOnRoomClose;
-    private static ConfigEntry<bool>? s_verboseLogging;
+    private static ManualLogSource s_log;
+    private static ConfigEntry<int> s_maxPlayers;
+    private static ConfigEntry<bool> s_patchSteamLobby;
+    private static ConfigEntry<bool> s_shrinkOnRoomClose;
+    private static ConfigEntry<bool> s_verboseLogging;
 
-    private Harmony? _harmony;
+    private Harmony _harmony;
 
     public override void Load()
     {
@@ -124,7 +124,7 @@ public sealed class Plugin : BasePlugin
         LogInfo($"Patched {patched} Steamworks lobby creation method(s).");
     }
 
-    private static int PatchNamedMethods(Harmony harmony, Type type, IReadOnlyCollection<string> names, HarmonyMethod? prefix, HarmonyMethod? postfix)
+    private static int PatchNamedMethods(Harmony harmony, Type type, IReadOnlyCollection<string> names, HarmonyMethod prefix, HarmonyMethod postfix)
     {
         var count = 0;
         foreach (var method in AccessTools.GetDeclaredMethods(type))
@@ -149,7 +149,7 @@ public sealed class Plugin : BasePlugin
         return count;
     }
 
-    private static void PhotonRoomCreatePrefix(MethodBase __originalMethod, object?[] __args)
+    private static void PhotonRoomCreatePrefix(MethodBase __originalMethod, object[] __args)
     {
         try
         {
@@ -161,7 +161,7 @@ public sealed class Plugin : BasePlugin
         }
     }
 
-    private static void SteamLobbyCreatePrefix(MethodBase __originalMethod, object?[] __args)
+    private static void SteamLobbyCreatePrefix(MethodBase __originalMethod, object[] __args)
     {
         try
         {
@@ -189,7 +189,7 @@ public sealed class Plugin : BasePlugin
         }
     }
 
-    private static void RewriteRoomCreationArguments(MethodBase method, object?[] args)
+    private static void RewriteRoomCreationArguments(MethodBase method, object[] args)
     {
         var parameters = method.GetParameters();
         for (var i = 0; i < args.Length && i < parameters.Length; i++)
@@ -214,7 +214,7 @@ public sealed class Plugin : BasePlugin
         }
     }
 
-    private static void RewriteMaxPlayerArguments(MethodBase method, object?[] args, string source)
+    private static void RewriteMaxPlayerArguments(MethodBase method, object[] args, string source)
     {
         var parameters = method.GetParameters();
         for (var i = 0; i < args.Length && i < parameters.Length; i++)
@@ -274,7 +274,7 @@ public sealed class Plugin : BasePlugin
         }
     }
 
-    internal static object? GetMember(object instance, string name)
+    internal static object GetMember(object instance, string name)
     {
         var type = instance.GetType();
         var property = AccessTools.Property(type, name);
@@ -305,13 +305,13 @@ public sealed class Plugin : BasePlugin
         field.SetValue(instance, Convert.ChangeType(value, Nullable.GetUnderlyingType(field.FieldType) ?? field.FieldType));
     }
 
-    private static Type? GetMemberType(Type type, string name)
+    private static Type GetMemberType(Type type, string name)
     {
         return AccessTools.Property(type, name)?.PropertyType
             ?? AccessTools.Field(type, name)?.FieldType;
     }
 
-    internal static Type? TypeByName(string name) => AccessTools.TypeByName(name);
+    internal static Type TypeByName(string name) => AccessTools.TypeByName(name);
 
     internal static void LogInfo(string message) => s_log?.LogInfo(message);
     internal static void LogDebug(string message) => s_log?.LogDebug(message);
@@ -393,7 +393,7 @@ public sealed class RoomCapacityMonitor : MonoBehaviour
         return Convert.ToBoolean(ReadStaticMember(type, propertyName));
     }
 
-    private static object? ReadStaticMember(Type type, string propertyName)
+    private static object ReadStaticMember(Type type, string propertyName)
     {
         var property = AccessTools.Property(type, propertyName);
         if (property?.CanRead == true)
