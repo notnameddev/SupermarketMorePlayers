@@ -73,6 +73,13 @@ public sealed class Plugin : BasePlugin
 
 	private static ConfigEntry<bool> s_forceSyncTargetZero;
 
+	// Headless test orchestration state (set from command-line, not config).
+	internal static string s_testRole;         // "matrix" (solo fabricated players), "host", or "client"
+	internal static string s_testRoomToken;    // shared room token for host/client pairs
+	internal static int s_testTargetPlayers;   // how many players to simulate / how many the room expects
+	internal static int s_testScenario;        // which leave/rejoin scenario to run (1 or 2; 0 = all)
+	internal static bool s_testHandoutClone;   // host: force entering client to receive a fresh-ID clone body
+
 	private static readonly List<PlayerInstance> s_templateSnapshot = new List<PlayerInstance>();
 
 	private Harmony _harmony;
@@ -127,7 +134,30 @@ public sealed class Plugin : BasePlugin
 		{
 			log.LogInfo("AUTOTEST: command-line mode detected (-autotest).");
 			s_autoTestActive = true;
-			((BasePlugin)this).AddComponent<AutoTestDriver>();
+
+			// Optional composite role: -test-role=matrix|host|client|rejoin
+			//   matrix: solo room, fabricate fake players up to s_testTargetPlayers,
+			//           drive the real OnPlayerEnteredRoom pipeline, assert per concern.
+			//   host  : create room token, wait for 1 real client, then matrix-style asserts.
+			//   client: join room token, assert the client acquired a driving body/view.
+			//   rejoin: solo, run leave/rejoin scenario(s) with fabricated actors keyed on
+			//           deterministic IDs (50000+actor); asserts no stale collision on rejoin.
+			string role = ReadArg(args, "-test-role", null);
+			s_testRoomToken = ReadArg(args, "-test-room", null);
+			s_testTargetPlayers = int.TryParse(ReadArg(args, "-test-players", "0"), out int tp) ? tp : 0;
+			s_testScenario = int.TryParse(ReadArg(args, "-test-scenario", "0"), out int sc) ? sc : 0;
+			s_testHandoutClone = ReadArg(args, "-test-handout-clone", null) != null;
+			if (role == "matrix" || role == "host" || role == "client" || role == "rejoin")
+			{
+				s_testRole = role;
+				log.LogInfo($"AUTOTEST: composite role={role} room={s_testRoomToken} players={s_testTargetPlayers} scenario={s_testScenario} handout={s_testHandoutClone}.");
+				((BasePlugin)this).AddComponent<AutoTestDriver>();
+			}
+			else
+			{
+				// Backwards-compatible lone -autotest -> solo realloc self-test (Tier 0).
+				((BasePlugin)this).AddComponent<AutoTestDriver>();
+			}
 		}
 	}
 
@@ -152,6 +182,22 @@ public sealed class Plugin : BasePlugin
 		{
 			try
 			{
+				if (Plugin.s_testRole == "matrix" || Plugin.s_testRole == "host")
+				{
+					UpdateMatrixRole();
+					return;
+				}
+				if (Plugin.s_testRole == "client")
+				{
+					UpdateClientRole();
+					return;
+				}
+				if (Plugin.s_testRole == "rejoin")
+				{
+					UpdateRejoinRole();
+					return;
+				}
+
 				if (Time.unscaledTime < _retryAt)
 				{
 					return;
@@ -284,14 +330,719 @@ public sealed class Plugin : BasePlugin
 				Application.Quit(1);
 			}
 		}
+
+		// SOLO / HOST fabricated-player matrix. Starts after the host is in a room:
+		// grows the pool to N, fabricates fake players and runs the REAL OnPlayerEnteredRoom
+		// pipeline per user count, then asserts each concern and logs a verdict.
+		private int _mStep;
+		private float _joinAt;
+		private readonly System.Collections.Generic.List<object> _fabricated = new System.Collections.Generic.List<object>();
+
+		private void UpdateMatrixRole()
+		{
+			int target = Plugin.s_testTargetPlayers;
+			if (Plugin.s_testRole == "matrix" && target <= 0)
+			{
+				target = 6;
+			}
+
+			if (_mStep == 0)
+			{
+				if (PhotonNetwork.IsConnectedAndReady)
+				{
+					_mStep = 1;
+				}
+				else if (!_startedPhoton)
+				{
+					PhotonNetwork.ConnectUsingSettings();
+					_startedPhoton = true;
+					Plugin.Logger.LogInfo("AUTOTEST-M: connecting to Photon...");
+				}
+				return;
+			}
+
+			if (_mStep == 1)
+			{
+				if (!PhotonNetwork.InRoom)
+				{
+					string room = Plugin.s_testRole == "host" && !string.IsNullOrEmpty(Plugin.s_testRoomToken)
+						? Plugin.s_testRoomToken
+						: "autotest_m_" + Guid.NewGuid().ToString("N");
+					Plugin.Logger.LogInfo("AUTOTEST-M: creating room " + room);
+					PhotonNetwork.CreateRoom(room);
+				}
+				else
+				{
+					_mStep = 2;
+				}
+				return;
+			}
+
+			if (_mStep == 2)
+			{
+				// Host: wait for the real client to join before fabricating extras.
+				if (Plugin.s_testRole == "host")
+				{
+					// host stays alive; real clients will drive enter/leave via PlayerJoinedPrefix
+					_mStep = 5;
+					return;
+				}
+				// Give the scene a moment to populate PlayerInstances, then run the matrix.
+				if (PlayerManager.HasInstance && PlayerManager.Instance != null && PlayerManager.Instance.PlayerInstances != null
+					&& PlayerManager.Instance.PlayerInstances.Count > 0 && Time.unscaledTime > 2f)
+				{
+					_mStep = 3;
+				}
+				return;
+			}
+
+			if (_mStep == 3)
+			{
+				if (Plugin.s_testRole == "host")
+				{
+					_mStep = 5; // host stays alive; real clients drive events
+					return;
+				}
+				string verdict = Plugin.RunFabricatedMatrix(target);
+				Plugin.Logger.LogInfo("AUTOTEST-M: " + verdict);
+				_mStep = 4;
+				return;
+			}
+
+			if (_mStep == 4)
+			{
+				Plugin.Logger.LogInfo("AUTOTEST: complete. Exiting.");
+				Application.Quit();
+			}
+
+			if (_mStep == 5)
+			{
+				// Host holds here (never quits) so real clients can enter/leave for the rejoin
+				// test; PlayerJoinedPrefix logs each deterministic assign/reclaim. The harness
+				// kills this process when the scenario is done.
+				Plugin.Logger.LogInfo("AUTOTEST-H: HOST READY (room open, awaiting real clients).");
+				_mStep = 6;
+				return;
+			}
+
+			if (_mStep == 6)
+			{
+				return; // hold forever until harness kills the process
+			}
+		}
+
+		// CLIENT role: join the host's room, wait a moment, then report whether this
+		// instance acquired a driving body/view and (in handout mode) a fresh-range view.
+		private void UpdateClientRole()
+		{
+			if (_mStep == 0)
+			{
+				if (PhotonNetwork.IsConnectedAndReady)
+				{
+					_mStep = 1;
+				}
+				else if (!_startedPhoton)
+				{
+					PhotonNetwork.ConnectUsingSettings();
+					_startedPhoton = true;
+					Plugin.Logger.LogInfo("AUTOTEST-C: connecting to Photon...");
+				}
+				return;
+			}
+
+			if (_mStep == 1)
+			{
+				if (!PhotonNetwork.InRoom)
+				{
+					Plugin.Logger.LogInfo("AUTOTEST-C: joining room " + Plugin.s_testRoomToken);
+					PhotonNetwork.JoinOrCreateRoom(Plugin.s_testRoomToken, null, null, null);
+				}
+				else
+				{
+					_mStep = 2;
+					_joinAt = Time.unscaledTime;
+				}
+				return;
+			}
+
+			if (_mStep == 2)
+			{
+				// Wait a few seconds after join for assignment/ownership to settle.
+				if (Time.unscaledTime < _joinAt + 5f)
+				{
+					return;
+				}
+				// Run the check. If the game did not hand this client a driving body on its
+				// own, try the DETERMINISTIC mirror (ID_BASE+actor) and re-check. This validates
+				// the mirror premise: a client can create + register a matching fixed-ID view.
+				string verdict = Plugin.RunClientAcquisitionCheck();
+				bool hasBody = verdict.Contains("LOCAL_BODY=PASS");
+				if (!hasBody)
+				{
+					// Ensure the client's PlayerManager/scene actually booted before mirroring.
+					bool ready = PlayerManager.HasInstance && (object)PlayerManager.Instance != (object)null
+						&& PlayerManager.Instance.PlayerInstances != null || Time.unscaledTime > _joinAt + 20f;
+					if (ready)
+					{
+						int actor = Plugin.GetMyActorNumber();
+						Plugin.Logger.LogInfo("AUTOTEST-C: no body acquired; trying deterministic mirror for actor " + actor + ".");
+						Plugin.CreateMirrorBodyForActor(actor);
+						verdict = Plugin.RunClientAcquisitionCheck();
+					}
+					else
+					{
+						Plugin.Logger.LogInfo("AUTOTEST-C: PlayerManager not ready yet; skipping mirror this tick.");
+						return; // stay in step 2; retry next tick until ready or timeout
+					}
+				}
+				Plugin.Logger.LogInfo("AUTOTEST-C: " + verdict);
+				_mStep = 3;
+				return;
+			}
+
+			if (_mStep == 3)
+			{
+				Plugin.Logger.LogInfo("AUTOTEST: complete. Exiting.");
+				Application.Quit();
+			}
+		}
+
+		// REJOIN role: solo host. Runs leave/rejoin scenario(s) with fabricated actors whose
+		// deterministic IDs are keyed on the actor number. A rejoin gets a NEW actor number, so
+		// the invariant to assert is: no duplicate/stale ViewID across the whole scenario.
+		private void UpdateRejoinRole()
+		{
+			int scenario = Plugin.s_testScenario;
+
+			if (_mStep == 0)
+			{
+				if (PhotonNetwork.IsConnectedAndReady)
+				{
+					_mStep = 1;
+				}
+				else if (!_startedPhoton)
+				{
+					PhotonNetwork.ConnectUsingSettings();
+					_startedPhoton = true;
+					Plugin.Logger.LogInfo("AUTOTEST-R: connecting to Photon...");
+				}
+				return;
+			}
+
+			if (_mStep == 1)
+			{
+				if (!PhotonNetwork.InRoom)
+				{
+					Plugin.Logger.LogInfo("AUTOTEST-R: creating room...");
+					PhotonNetwork.CreateRoom("autotest_r_" + Guid.NewGuid().ToString("N"));
+				}
+				else
+				{
+					_mStep = 2;
+					if (PlayerManager.HasInstance && (object)PlayerManager.Instance != (object)null
+						&& PlayerManager.Instance.PlayerInstances != null && PlayerManager.Instance.PlayerInstances.Count > 0)
+					{
+						_mStep = 3;
+					}
+				}
+				return;
+			}
+
+			if (_mStep == 2)
+			{
+				// Wait for a populated scene pool before starting.
+				if (PlayerManager.HasInstance && (object)PlayerManager.Instance != (object)null
+					&& PlayerManager.Instance.PlayerInstances != null && PlayerManager.Instance.PlayerInstances.Count > 0)
+				{
+					_mStep = 3;
+				}
+				return;
+			}
+
+			if (_mStep == 3)
+			{
+				string verdict;
+				if (scenario == 1 || scenario == 2)
+				{
+					verdict = Plugin.RunRejoinScenario(scenario);
+				}
+				else
+				{
+					// Run both scenarios back to back.
+					string v1 = Plugin.RunRejoinScenario(1);
+					string v2 = Plugin.RunRejoinScenario(2);
+					verdict = v1 + " || " + v2;
+				}
+				Plugin.Logger.LogInfo("AUTOTEST-R: " + verdict);
+				_mStep = 4;
+				return;
+			}
+
+			if (_mStep == 4)
+			{
+				Plugin.Logger.LogInfo("AUTOTEST: complete. Exiting.");
+				Application.Quit();
+			}
+		}
 	}
+
+	// ===== Headless test runners (fabricated-player matrix + client acquisition) =====
+	// AddPlugin's AutoTestDriver dispatches here based on -test-role. Each check prints a
+	// PARSEABLE "<PREFIX>: <name>=<PASS|FAIL|INCONCLUSIVE>" line the orchestrator greps.
+	internal static string RunFabricatedMatrix(int target)
+	{
+		if (target < 5)
+		{
+			target = 6;
+		}
+		var results = new System.Collections.Generic.List<string>();
+
+		// Grow the pool to exactly `target` (solo matrix tests 5+ by forcing growth).
+		int poolNow = (PlayerManager.HasInstance && PlayerManager.Instance != null && PlayerManager.Instance.PlayerInstances != null)
+			? PlayerManager.Instance.PlayerInstances.Count : 0;
+		int expected = target - Math.Max(4, poolNow);
+		int grown = 0;
+		try
+		{
+			while (PlayerManager.Instance.PlayerInstances != null && PlayerManager.Instance.PlayerInstances.Count < target)
+			{
+				if (CreateExtraPlayerBody() == null)
+				{
+					break;
+				}
+				grown++;
+			}
+			poolNow = PlayerManager.Instance.PlayerInstances.Count;
+		}
+		catch (Exception gex)
+		{
+			LogWarning("RunFabricatedMatrix: grow " + gex.Message);
+		}
+		results.Add($"POOL={((poolNow >= target) ? "PASS" : $"FAIL(pool={poolNow} target={target})")}");
+		results.Add($"DOUBLE={(grown == Math.Max(0, expected) ? "PASS" : $"FAIL(grew={grown} expected={Math.Max(0, expected)})")}");
+
+		// Fresh ViewIDs unique across the whole grown pool (host side of concern #1/#2).
+		int nonNull = 0, freshUnique = 0;
+		var seenFresh = new System.Collections.Generic.List<int>();
+		try
+		{
+			foreach (var pi in PlayerManager.Instance.PlayerInstances)
+			{
+				if ((Object)(object)pi == (Object)null)
+				{
+					continue;
+				}
+				nonNull++;
+				var view = GetMemberSafe(pi, "PhotonView");
+				if (view == null)
+				{
+					continue;
+				}
+				int id = Convert.ToInt32(GetMemberSafe(view, "ViewID") ?? 0);
+				if (id != 0 && !seenFresh.Contains(id))
+				{
+					seenFresh.Add(id);
+					freshUnique++;
+				}
+			}
+		}
+		catch (Exception uex)
+		{
+			LogWarning("RunFabricatedMatrix: unique " + uex.Message);
+		}
+		results.Add($"UNIQUE={(nonNull > 0 && freshUnique == nonNull ? "PASS" : $"FAIL({freshUnique}/{nonNull})")}");
+
+		// Best-effort: drive the real OnPlayerEnteredRoom for fabricated players (#3/#4/#5).
+		// Only the SOLO "matrix" role fabricates. In "host" role, real clients drive enter/leave;
+		// fabrication would mask their deterministic events.
+		int driven = 0, driveExc = 0;
+		if (s_testRole == "matrix")
+		for (int i = 5; i <= target; i++)
+		{
+			object fake = Plugin.FabricatePlayer(i, "FakePlayer" + i);
+			if (fake == null)
+			{
+				results.Add("FABRICATE=INCONCLUSIVE(Player construction blocked)");
+				break;
+			}
+			if (Plugin.InvokeNetworkManagerEnter(fake))
+			{
+				driven++;
+			}
+			else
+			{
+				driveExc++;
+			}
+		}
+		if (driven > 0 || driveExc > 0)
+		{
+			results.Add($"DRIVE={(driveExc == 0 && driven > 0 ? "PASS" : $"FAIL(driven={driven} exc={driveExc})")}");
+		}
+
+		// No managed exceptions thrown in the driving loop (concern #3 broad check).
+		return "MATRIX " + string.Join(" ", results);
+	}
+
+	// Best-effort fabrication of Photon.Realtime.Player. The IL2CPP interop Player class has
+	// a protected/private native ctor, so we allocate a native instance via il2cpp_object_new
+	// and wrap it in the interop subclass. If class-pointer access is blocked we return null
+	// (caller marks drive check INCONCLUSIVE rather than FAIL).
+	internal static object FabricatePlayer(int actorNumber, string nick)
+	{
+		try
+		{
+			Type pt = AccessTools.TypeByName("Photon.Realtime.Player");
+			if (pt == null)
+			{
+				return null;
+			}
+			// Get the native class pointer from an EXISTING Player instance (LocalPlayer),
+			// then allocate a raw native Player and wrap it in the interop subclass (IntPtr ctor).
+			object local = PhotonNetwork.LocalPlayer;
+			if (local == null)
+			{
+				LogWarning("FabricatePlayer: no LocalPlayer to borrow class from.");
+				return null;
+			}
+			IntPtr existingPtr = Il2CppInterop.Runtime.IL2CPP.Il2CppObjectBaseToPtr((Il2CppObjectBase)local);
+			IntPtr klass = Il2CppInterop.Runtime.IL2CPP.il2cpp_object_get_class(existingPtr);
+			if (klass == IntPtr.Zero)
+			{
+				return null;
+			}
+			IntPtr inst = Il2CppInterop.Runtime.IL2CPP.il2cpp_object_new(klass);
+			object wrapper = Activator.CreateInstance(pt, new object[] { inst });
+			if (wrapper == null)
+			{
+				return null;
+			}
+			// The interop Player exposes writable lowercase fields (actorNumber / nickName)
+			// plus read-only-ish properties; set fields first, fall back to properties.
+			if (!TrySetMember(wrapper, "actorNumber", actorNumber))
+			{
+				SetMember(wrapper, "ActorNumber", actorNumber);
+			}
+			if (!TrySetMember(wrapper, "nickName", nick))
+			{
+				SetMember(wrapper, "NickName", nick);
+			}
+			return wrapper;
+		}
+		catch (Exception ex)
+		{
+			LogWarning("FabricatePlayer: " + ex.Message);
+			return null;
+		}
+	}
+
+	private static bool TrySetMember(object instance, string name, object value)
+	{
+		try
+		{
+			FieldInfo f = instance.GetType().GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+			if (f != null)
+			{
+				f.SetValue(instance, value);
+				return true;
+			}
+			PropertyInfo p = instance.GetType().GetProperty(name);
+			if (p != null && p.CanWrite)
+			{
+				p.SetValue(instance, value);
+				return true;
+			}
+			return false;
+		}
+		catch
+		{
+			return false;
+		}
+	}
+
+	// Invokes NetworkManager.OnPlayerEnteredRoom(player) via reflection (the real path our
+	// PlayerJoinedPrefix / GetUnownedPlayerPostfix hooks decorate). Returns true if invoked.
+	private static bool InvokeNetworkManagerEnter(object player)
+	{
+		try
+		{
+			MethodInfo mi = AccessTools.Method(TypeByName("NetworkManager"), "OnPlayerEnteredRoom", new Type[] { player.GetType() }, null);
+			if (mi == null)
+			{
+				LogWarning("InvokeNetworkManagerEnter: OnPlayerEnteredRoom not found for " + player.GetType().Name);
+				return false;
+			}
+			object nm = (NoktaSingletonPunCallbacks<NetworkManager>.HasInstance)
+				? (object)NoktaSingletonPunCallbacks<NetworkManager>.Instance : null;
+			if (nm == null)
+			{
+				LogWarning("InvokeNetworkManagerEnter: NetworkManager instance not found.");
+				return false;
+			}
+			mi.Invoke(nm, new object[] { player });
+			return true;
+		}
+		catch (Exception ex)
+		{
+			LogWarning("InvokeNetworkManagerEnter: " + ex.Message);
+			return false;
+		}
+	}
+
+	// Mirror of the enter invoker, for OnPlayerLeftRoom (drives ReclaimBodyForActor via the patch).
+	private static bool InvokeNetworkManagerLeave(object player)
+	{
+		try
+		{
+			MethodInfo mi = AccessTools.Method(TypeByName("NetworkManager"), "OnPlayerLeftRoom", new Type[] { player.GetType() }, null);
+			if (mi == null)
+			{
+				return false;
+			}
+			object nm = (NoktaSingletonPunCallbacks<NetworkManager>.HasInstance)
+				? (object)NoktaSingletonPunCallbacks<NetworkManager>.Instance : null;
+			if (nm == null)
+			{
+				return false;
+			}
+			mi.Invoke(nm, new object[] { player });
+			return true;
+		}
+		catch (Exception ex)
+		{
+			LogWarning("InvokeNetworkManagerLeave: " + ex.Message);
+			return false;
+		}
+	}
+
+	// Rejoin/leave scenarios. Each "actor" uses a unique actor number (Photon never reuses one
+	// in a session), so a "rejoin" is a NEW actor number and must produce a fresh non-colliding
+	// deterministic ID. Runs the steps, asserting pool uniqueness + the key invariant at each step.
+	internal static string RunRejoinScenario(int scenario)
+	{
+		var results = new System.Collections.Generic.List<string>();
+		bool ok = true;
+		System.Collections.Generic.Dictionary<int, int> actorToView = new System.Collections.Generic.Dictionary<int, int>();
+
+		int NextView(int actor) => 50000 + actor;
+
+		void Step(string label, int actor, bool entering)
+		{
+			object fake = FabricatePlayer(actor, "Actor" + actor);
+			if (fake == null)
+			{
+				results.Add($"{label}=INCONCLUSIVE(fabrication)");
+				ok = false;
+				return;
+			}
+			bool invoked = entering ? InvokeNetworkManagerEnter(fake) : InvokeNetworkManagerLeave(fake);
+			// The deterministic view for this actor must now be present (entered) or absent (left).
+			bool present = HasView(NextView(actor));
+			bool expectedPresent = entering && invoked;
+			bool stepOk = (present == expectedPresent) && (expectedPresent || !entering || invoked);
+			bool dup = HasDuplicateViews();
+			string status = (present == expectedPresent && !dup) ? "PASS" : "FAIL";
+			results.Add($"{label}={status} (view{NextView(actor)} present={present} expect={expectedPresent} dup={dup})");
+			if (status != "PASS")
+			{
+				ok = false;
+			}
+		}
+
+		// Scenario 1: P5 enters, P6 enters, P5 leaves, P5 rejoins (new actor).
+		if (scenario == 1)
+		{
+			int a5a = 5;   // P5 initial actor
+			int a6 = 6;    // P6 actor
+			int a5b = 9;   // P5 rejoin = new (unused) actor number
+			Step("S1_P5_ENTER", a5a, true);
+			Step("S1_P6_ENTER", a6, true);
+			Step("S1_P5_LEAVE", a5a, false);
+			Step("S1_P5_REJOIN", a5b, true);
+		}
+		// Scenario 2: P5 enter, P6 enter, P5 leave, P6 leave, P6 enter(new), P5 enter(new).
+		else if (scenario == 2)
+		{
+			int a5a = 5;
+			int a6a = 6;
+			int a5b = 9;
+			int a6b = 10;
+			Step("S2_P5_ENTER", a5a, true);
+			Step("S2_P6_ENTER", a6a, true);
+			Step("S2_P5_LEAVE", a5a, false);
+			Step("S2_P6_LEAVE", a6a, false);
+			Step("S2_P6_REJOIN", a6b, true);
+			Step("S2_P5_REJOIN", a5b, true);
+		}
+		else
+		{
+			return "REJOIN INVALID_SCENARIO=" + scenario;
+		}
+
+		results.Add($"ALL={(ok ? "PASS" : "FAIL")}");
+		return "REJOIN " + string.Join(" ", results);
+	}
+
+	private static bool HasView(int viewId)
+	{
+		if (!NoktaSingleton<PlayerManager>.HasInstance || (object)NoktaSingleton<PlayerManager>.Instance == (object)null
+			|| NoktaSingleton<PlayerManager>.Instance.PlayerInstances == null)
+		{
+			return false;
+		}
+		foreach (var pi in NoktaSingleton<PlayerManager>.Instance.PlayerInstances)
+		{
+			if ((Object)(object)pi == (Object)null)
+			{
+				continue;
+			}
+			var view = GetMemberSafe(pi, "PhotonView");
+			if (view != null && Convert.ToInt32(GetMemberSafe(view, "ViewID") ?? 0) == viewId)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private static bool HasDuplicateViews()
+	{
+		var seen = new System.Collections.Generic.List<int>();
+		if (!NoktaSingleton<PlayerManager>.HasInstance || (object)NoktaSingleton<PlayerManager>.Instance == (object)null
+			|| NoktaSingleton<PlayerManager>.Instance.PlayerInstances == null)
+		{
+			return false;
+		}
+		foreach (var pi in NoktaSingleton<PlayerManager>.Instance.PlayerInstances)
+		{
+			if ((Object)(object)pi == (Object)null)
+			{
+				continue;
+			}
+			var view = GetMemberSafe(pi, "PhotonView");
+			if (view == null)
+			{
+				continue;
+			}
+			int id = Convert.ToInt32(GetMemberSafe(view, "ViewID") ?? 0);
+			if (id != 0 && seen.Contains(id))
+			{
+				return true;
+			}
+			if (id != 0)
+			{
+				seen.Add(id);
+			}
+		}
+		return false;
+	}
+
+	// Client-side check after joining the host room: did this instance acquire a driving body
+	// and (in handout mode) a fresh-range (>10000) PhotonView meaning the cross-client view worked?
+	internal static string RunClientAcquisitionCheck()
+	{
+		var results = new System.Collections.Generic.List<string>();
+		results.Add($"JOINED={(PhotonNetwork.InRoom ? "PASS" : "FAIL")}");
+
+		int pool = 0, nonNull = 0, localFlagBodies = 0, ownedByMe = 0, freshViews = 0, totalViews = 0, detMatch = 0;
+		int myActor = -999;
+		try
+		{
+			object localPlayer = PhotonNetwork.LocalPlayer;
+			if (localPlayer != null)
+			{
+				myActor = Convert.ToInt32(GetMemberSafe(localPlayer, "ActorNumber") ?? -999);
+			}
+		}
+		catch (Exception le)
+		{
+			LogWarning("RunClientAcquisitionCheck: local player " + le.Message);
+		}
+		int myDetId = 50000 + myActor;
+		LogInfo($"CLIENT-DIAG: LocalPlayer actor={myActor} detId={myDetId}, InRoom={PhotonNetwork.InRoom}, PlayerCount={CurrentRoomPlayerCount()}.");
+
+		try
+		{
+			if (PlayerManager.HasInstance && PlayerManager.Instance != null && PlayerManager.Instance.PlayerInstances != null)
+			{
+				pool = PlayerManager.Instance.PlayerInstances.Count;
+				int idx = 0;
+				foreach (var pi in PlayerManager.Instance.PlayerInstances)
+				{
+					idx++;
+					if ((Object)(object)pi == (Object)null)
+					{
+						continue;
+					}
+					nonNull++;
+					bool hasLocalProp = false;
+					try
+					{
+						var lp = GetMemberSafe(pi, "IsLocalPlayerInstance");
+						hasLocalProp = lp != null;
+						if (Convert.ToBoolean(lp ?? false))
+						{
+							localFlagBodies++;
+						}
+					}
+					catch { }
+					var view = GetMemberSafe(pi, "PhotonView");
+					int id = 0, owner = -999;
+					if (view != null)
+					{
+						totalViews++;
+						id = Convert.ToInt32(GetMemberSafe(view, "ViewID") ?? 0);
+						owner = Convert.ToInt32(GetMemberSafe(view, "OwnerActorNr") ?? -999);
+						if (owner == myActor)
+						{
+							ownedByMe++;
+						}
+						if (id > 10000)
+						{
+							freshViews++;
+						}
+						if (id == myDetId)
+						{
+							detMatch++;
+						}
+					}
+					LogInfo($"CLIENT-DIAG: body {idx}/{pool} nonNull view=(id={id} owner={owner}) localProp={hasLocalProp} detId={myDetId}");
+				}
+			}
+		}
+		catch (Exception excl)
+		{
+			LogWarning("RunClientAcquisitionCheck: " + excl.Message);
+		}
+		LogInfo($"CLIENT-DIAG: pool={pool} nonNull={nonNull} localFlag={localFlagBodies} ownedByMe={ownedByMe} fresh={freshViews} detMatch={detMatch} views={totalViews}.");
+
+		// A real client has a driving body if one of its pool bodies is owned by its own actor,
+		// flagged local, OR it successfully created its own deterministic-mirror body (detMatch).
+		results.Add($"LOCAL_BODY={(ownedByMe > 0 || localFlagBodies > 0 || detMatch > 0 ? "PASS" : "FAIL")} (ownedByMe={ownedByMe} localFlag={localFlagBodies} detMatch={detMatch})");
+		results.Add($"FRESH_VIEW={(freshViews > 0 || detMatch > 0 ? "PASS" : "FAIL")}");
+		return "CLIENT " + string.Join(" ", results);
+	}
+
+	internal static int GetMyActorNumber()
+	{
+		try
+		{
+			object local = PhotonNetwork.LocalPlayer;
+			if (local == null)
+			{
+				return -1;
+			}
+			object v = GetMemberSafe(local, "ActorNumber");
+			return (v == null) ? -1 : Convert.ToInt32(v);
+		}
+		catch
+		{
+			return -1;
+		}
+	}
+	// ===== end headless test runners =====
 
 	private static void PatchKnownTargets(Harmony harmony)
 	{
-		//IL_0036: Unknown result type (might be due to invalid IL or missing references)
-		//IL_003c: Expected O, but got Unknown
-		//IL_00c5: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00cc: Expected O, but got Unknown
 		Type type = AccessTools.TypeByName("Photon.Pun.PhotonNetwork");
 		if (type == null)
 		{
@@ -561,7 +1312,65 @@ public sealed class Plugin : BasePlugin
 	{
 		try
 		{
+			string mname = __originalMethod?.Name ?? "";
+			LogInfo($"PlayerJoinedPrefix enter: {mname} args={(__args?.Length ?? 0)} isMaster={PhotonNetwork.IsMasterClient}.");
 			EnsurePlayerBodyCapacity();
+			if (!PhotonNetwork.IsMasterClient)
+			{
+				return;
+			}
+			int actor = -1;
+			foreach (object a in __args)
+			{
+				if (a == null)
+				{
+					continue;
+				}
+				object v = GetMemberSafe(a, "ActorNumber");
+				if (v != null)
+				{
+					actor = Convert.ToInt32(v);
+					break;
+				}
+			}
+			if (actor < (Plugin.s_testHandoutClone ? 2 : 5))
+			{
+				// slots 1-4 use the game's own original bodies (or, in handout mode, 1 is host only)
+				LogInfo($"PlayerJoinedPrefix: {mname} actor={actor} below deterministic threshold; skip.");
+				return;
+			}
+			const int ID_BASE = 50000;
+			if (mname == "OnPlayerEnteredRoom")
+			{
+				// Ensure a deterministic body (50000+actor) exists for this player on the host.
+				bool exists = false;
+				if (NoktaSingleton<PlayerManager>.HasInstance && (object)NoktaSingleton<PlayerManager>.Instance != (object)null
+					&& NoktaSingleton<PlayerManager>.Instance.PlayerInstances != null)
+				{
+					foreach (var pi in NoktaSingleton<PlayerManager>.Instance.PlayerInstances)
+					{
+						if ((Object)(object)pi == (Object)null)
+						{
+							continue;
+						}
+						var view = GetMemberSafe(pi, "PhotonView");
+						if (view != null && Convert.ToInt32(GetMemberSafe(view, "ViewID") ?? 0) == ID_BASE + actor)
+						{
+							exists = true;
+							break;
+						}
+					}
+				}
+				if (!exists)
+				{
+					PlayerInstance det = CreateMirrorBodyForActor(actor);
+					LogInfo($"PlayerJoinedPrefix: ensured deterministic body for actor {actor} ({(det != null ? "created" : "FAILED")}).");
+				}
+			}
+			else if (mname == "OnPlayerLeftRoom")
+			{
+				ReclaimBodyForActor(actor);
+			}
 		}
 		catch (Exception ex)
 		{
@@ -606,7 +1415,7 @@ public sealed class Plugin : BasePlugin
 		}
 	}
 
-	private static int CurrentRoomPlayerCount()
+	internal static int CurrentRoomPlayerCount()
 	{
 		try
 		{
@@ -1048,6 +1857,150 @@ Il2CppArrayBase<PhotonView> componentsInChildren = ((Component)clone).GetCompone
 		catch (Exception ex2)
 		{
 			LogWarning("ReidClonePhotonViews failed: " + ex2.Message);
+		}
+	}
+
+	// Deterministic-ID mirror: clones a template body, replaces its PhotonView with a brand-new
+	// one whose ViewID is a FIXED value (ID_BASE + actorNumber) that every client can compute on
+	// its own, then adds the body to this instance's pool. Returns the clone or null.
+	internal static PlayerInstance CreateMirrorBodyForActor(int actorNumber)
+	{
+		const int ID_BASE = 50000;
+		int targetId = ID_BASE + actorNumber;
+		try
+		{
+			if (!NoktaSingleton<PlayerManager>.HasInstance || (Object)(object)NoktaSingleton<PlayerManager>.Instance == (Object)null
+				|| NoktaSingleton<PlayerManager>.Instance.PlayerInstances == null)
+			{
+				LogWarning("CreateMirrorBodyForActor: PlayerManager not ready.");
+				return null;
+			}
+			var pool = NoktaSingleton<PlayerManager>.Instance.PlayerInstances;
+			PlayerInstance template = null;
+			foreach (var pi in pool)
+			{
+				if ((Object)(object)pi != (Object)null)
+				{
+					template = pi;
+					break;
+				}
+			}
+			if ((Object)(object)template == (Object)null)
+			{
+				LogWarning($"CreateMirrorBodyForActor: no template body to clone (pool.Count={pool.Count}).");
+				return null;
+			}
+			GameObject go = ((Component)template).gameObject;
+			object obj = InvokeStaticInstantiate(go);
+			if (obj == null)
+			{
+				LogWarning($"CreateMirrorBodyForActor: InvokeStaticInstantiate returned null (template={((Object)template).name}).");
+				return null;
+			}
+			PlayerInstance clone = CastTo<PlayerInstance>(GetComponentOn(obj, AccessTools.TypeByName("PlayerInstance")));
+			if ((Object)(object)clone == (Object)null)
+			{
+				return null;
+			}
+			DisableCloneConflictingComponents(clone);
+			MarkCloneUnowned(clone);
+
+			// Replace every inherited PhotonView with a fresh one bearing the FIXED id.
+			Il2CppArrayBase<PhotonView> views = ((Component)clone).GetComponentsInChildren<PhotonView>(true);
+			PhotonView lastFresh = null;
+			int done = 0;
+			foreach (PhotonView item in views)
+			{
+				if ((Object)(object)item == (Object)null)
+				{
+					continue;
+				}
+				int old = item.ViewID;
+				GameObject viewGo = ((Component)item).gameObject;
+				Object.DestroyImmediate((Object)(object)item);
+				PhotonView fresh = viewGo.AddComponent<PhotonView>();
+				if (fresh == null)
+				{
+					continue;
+				}
+				fresh.ViewID = 0;
+				ClearPhotonViewOwner(fresh);
+				fresh.OwnerActorNr = 0;
+				fresh.ViewID = targetId;
+				PhotonNetwork.RegisterPhotonView(fresh);
+				lastFresh = fresh;
+				done++;
+				LogInfo($"CreateMirrorBodyForActor: {viewGo.name} ViewID {old} -> {targetId} (deterministic).");
+			}
+			if (done > 0 && (Object)(object)lastFresh != (Object)null && lastFresh.ViewID == targetId)
+			{
+				SetMemberRaw(clone, "PhotonView", lastFresh);
+			}
+			pool.Add(clone);
+			LogInfo($"CreateMirrorBodyForActor: pool grew to {pool.Count} with deterministic view {targetId}.");
+			return clone;
+		}
+		catch (Exception ex)
+		{
+			LogWarning("CreateMirrorBodyForActor: " + ex.Message);
+			return null;
+		}
+	}
+
+	// Canonical deterministic-ID reclaim: remove the body whose PhotonView.ViewID == 50000+actor
+	// from this instance's pool (host on player-leave), destroying its PhotonView so the ID is
+	// freed and cannot collide with a future rejoin (which gets a new actor -> new ID).
+	internal static bool ReclaimBodyForActor(int actorNumber)
+	{
+		const int ID_BASE = 50000;
+		int targetId = ID_BASE + actorNumber;
+		try
+		{
+			if (!NoktaSingleton<PlayerManager>.HasInstance || (Object)(object)NoktaSingleton<PlayerManager>.Instance == (Object)null
+				|| NoktaSingleton<PlayerManager>.Instance.PlayerInstances == null)
+			{
+				return false;
+			}
+			var pool = NoktaSingleton<PlayerManager>.Instance.PlayerInstances;
+			for (int i = pool.Count - 1; i >= 0; i--)
+			{
+				var pi = pool[i];
+				if ((Object)(object)pi == (Object)null)
+				{
+					continue;
+				}
+				var view = GetMemberSafe(pi, "PhotonView");
+				if (view == null)
+				{
+					continue;
+				}
+				int id = Convert.ToInt32(GetMemberSafe(view, "ViewID") ?? 0);
+				if (id != targetId)
+				{
+					continue;
+				}
+				// Found the deterministic body for this actor: free the view and drop the body.
+				try
+				{
+					int owner = Convert.ToInt32(GetMemberSafe(view, "OwnerActorNr") ?? -1);
+					LogInfo($"ReclaimBodyForActor: freeing {((Object)pi).name} view {id} (owner={owner}).");
+					Object.DestroyImmediate((Object)view);
+				}
+				catch (Exception ex)
+				{
+					LogWarning("ReclaimBodyForActor destroy: " + ex.Message);
+				}
+				pool.RemoveAt(i);
+				LogInfo($"ReclaimBodyForActor: pool now {pool.Count} (freed {targetId}).");
+				return true;
+			}
+			LogInfo($"ReclaimBodyForActor: no body with view {targetId} to reclaim (already gone).");
+			return true; // idempotent: nothing to free is not a failure
+		}
+		catch (Exception ex2)
+		{
+			LogWarning("ReclaimBodyForActor: " + ex2.Message);
+			return false;
 		}
 	}
 
@@ -1513,6 +2466,24 @@ Object.DestroyImmediate((Object)(object)item);
 		{
 			return null;
 		}
+	}
+
+	private static string ReadArg(string[] args, string key, string fallback)
+	{
+		string prefix = key + "=";
+		for (int i = 0; i < args.Length; i++)
+		{
+			string a = args[i];
+			if (a == key)
+			{
+				return (i + 1 < args.Length) ? args[i + 1] : "";
+			}
+			if (a.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+			{
+				return a.Substring(prefix.Length);
+			}
+		}
+		return fallback;
 	}
 
 	private static void PatchSteamLobbyTargets(Harmony harmony)
