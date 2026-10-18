@@ -3,14 +3,18 @@
     <TargetFramework>net6.0</TargetFramework>
     <AssemblyName>SupermarketMorePlayers</AssemblyName>
     <RootNamespace>SupermarketMorePlayers</RootNamespace>
-    <Nullable>enable</Nullable>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>preview</LangVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
   </PropertyGroup>
 
   <PropertyGroup>
+    <!-- Keep the BepInEx SDK location variable: pass -p:BepInExDir=... on the
+         command line (e.g. the Steam install path) or default to a sibling
+         BepInEx folder like the upstream project. No personal path is baked in. -->
     <BepInExDir Condition="'$(BepInExDir)' == ''">../BepInEx</BepInExDir>
     <BepInExCoreDir>$(BepInExDir)/core</BepInExCoreDir>
     <BepInExInteropDir>$(BepInExDir)/interop</BepInExInteropDir>
@@ -29,8 +33,35 @@
     <Reference Include="Il2CppInterop.Runtime" Private="false">
       <HintPath>$(BepInExCoreDir)/Il2CppInterop.Runtime.dll</HintPath>
     </Reference>
+    <Reference Include="Il2Cppmscorlib" Private="false">
+      <HintPath>$(BepInExInteropDir)/Il2Cppmscorlib.dll</HintPath>
+    </Reference>
+    <Reference Include="Il2CppSystem" Private="false">
+      <HintPath>$(BepInExInteropDir)/Il2CppSystem.dll</HintPath>
+    </Reference>
     <Reference Include="UnityEngine.CoreModule" Private="false">
       <HintPath>$(BepInExInteropDir)/UnityEngine.CoreModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.AudioModule" Private="false">
+      <HintPath>$(BepInExInteropDir)/UnityEngine.AudioModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.UI" Private="false">
+      <HintPath>$(BepInExInteropDir)/UnityEngine.UI.dll</HintPath>
+    </Reference>
+    <Reference Include="Unity.TextMeshPro" Private="false">
+      <HintPath>$(BepInExInteropDir)/Unity.TextMeshPro.dll</HintPath>
+    </Reference>
+    <Reference Include="Assembly-CSharp" Private="false">
+      <HintPath>$(BepInExInteropDir)/Assembly-CSharp.dll</HintPath>
+    </Reference>
+    <Reference Include="PhotonUnityNetworking" Private="false">
+      <HintPath>$(BepInExInteropDir)/PhotonUnityNetworking.dll</HintPath>
+    </Reference>
+    <Reference Include="Photon3Unity3D" Private="false">
+      <HintPath>$(BepInExInteropDir)/Photon3Unity3D.dll</HintPath>
+    </Reference>
+    <Reference Include="PhotonRealtime" Private="false">
+      <HintPath>$(BepInExInteropDir)/PhotonRealtime.dll</HintPath>
     </Reference>
   </ItemGroup>
 </Project>

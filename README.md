@@ -1,138 +1,88 @@
-# Supermarket More Players
+# SupermarketWithMoreFriends
 
-BepInEx IL2CPP plugin source for testing higher co-op limits in Supermarket Simulator.
+A BepInEx 6 (IL2CPP) mod for **Supermarket Simulator** that raises the co-op lobby
+from 4 players up to 8 (configurable 1–255). Players #5–#8 spawn as runtime-cloned
+player bodies with fresh Photon view IDs.
 
-## What the game analysis found
+## Status
 
-This game build is IL2CPP. The managed assembly names are listed in `Supermarket Simulator_Data/ScriptingAssemblies.json`, and the metadata confirms Photon PUN plus Facepunch Steamworks:
+- ✅ 4-player baseline intact
+- ✅ Room capacity 8 (Photon + Steam lobby), config-driven `MaxPlayers`
+- ✅ Loading-screen gate bypasses for 5+ player sessions
+- ✅ Runtime player-body pool grows 4 → N (clones of scene bodies)
+- ✅ Fresh PhotonView ID assignment for cloned bodies (headless 6-body autotest passes:
+  clones keep distinct IDs `10001`, `10002`, ...)
+- ⚠️ End-to-end 5-player *playtest* (movement/vision on both machines) still pending —
+  needs a real session with friends on this exact build
 
-- `PhotonRealtime.dll`
-- `PhotonUnityNetworking.dll`
-- `Photon3Unity3D.dll`
-- `Facepunch.Steamworks.Win64.dll`
+## Requirements
 
-The important game-side multiplayer types exposed by `global-metadata.dat` are:
+- Windows
+- Supermarket Simulator (Unity 6000.3.6f1, IL2CPP)
+- .NET 6 runtime shipped with the game (`<install>\dotnet\`)
 
-- `LobbyManager`
-  - Source path in metadata: `Assets/- Project -/Scripts/Multiplayer/LobbyManager.cs`
-  - Relevant methods: `CreateRoom`, `JoinTargetRoom`, `ExternalJoinTargetRoom`, `ConnectToServer`, `ConnectToRegion`, `OnConnectedToMaster`
-  - Relevant field: `m_MaxPlayersPerRoom`
-- `NetworkManager`
-  - Source path in metadata: `Assets/- Project -/Scripts/Multiplayer/Managers/NetworkManager.cs`
-  - Relevant methods/fields: `OnLoadingDone`, `InitialLoadingUIRoutine`, `InitialLoadingWarningRoutine`, `UpdatePlayerList`, `SetupNewPlayerVisuals`, `m_MaxWaitTimeForJoiningPlayers`
-- `RoomSettingsManager`
-  - Source path in metadata: `Assets/- Project -/Scripts/Multiplayer/RoomSettingsManager.cs`
-  - Relevant methods/fields: `UpdateList`, `ClearPlayerPrefabList`, `RemoveFromUIList`, `_roomInfoPlayers`
+## How it works
 
-That means the likely cap is not just a Photon constant. The mod patches both:
+The game scene contains exactly **4 `PlayerInstance` bodies** and has no code path that
+instantiates an additional player, and no player prefab exists in the assets. The mod:
 
-- Photon room creation methods, by forcing `RoomOptions.MaxPlayers`.
-- Facepunch/Steamworks lobby creation methods, by forcing max member arguments when those APIs are present.
+1. Raises the Photon room + Steam lobby caps (`MaxPlayers` in the config).
+2. When a 5th+ player joins and no unowned body exists, **clones** a scene player
+   body at runtime and grows `PlayerManager.PlayerInstances`.
+3. Replaces the clone's inherited PhotonView with a **brand-new** component that gets a
+   fresh runtime ID (`AllocateViewID`) — the scene's hardwired IDs can't be reused.
+4. Bypasses the game's loading gate (`_InitialLoadingUIRoutine_b__36_0` /
+   `_InitialLoadingWarningRoutine_b__37_0`), which never completes past 4 players.
 
-It also sets `LobbyManager.m_MaxPlayersPerRoom` before the game's own room methods run, because the game already has a private field for this value.
+Headless verification: pass `-autotest` to the game (with
+`Diagnostics.SelfTestPhotonRealloc = true` in the config) — it auto-connects to Photon,
+creates a room, grows the pool, prints `AUTOTEST6: ... PASS/FAIL`, and exits. No friends
+needed for the automated check.
 
-## Behavior
+## Build
 
-Default config:
+Requires a .NET 6 SDK. The csproj resolves the game's BepInEx core/interop DLLs from
+`BepInExDir` (defaults to the Steam install path; override with `-D:BepInExDir=...`).
+
+```powershell
+dotnet build -c Release
+```
+
+Deploy `bin\Release\net6.0\SupermarketMorePlayers.dll` to:
+
+```
+<game>\BepInEx\plugins\SupermarketMorePlayers.dll
+```
+
+## Config
+
+`BepInEx\config\dev.codex.supermarket.moreplayers.cfg`
 
 ```ini
 [General]
-MaxPlayers = 8
-PatchSteamLobby = true
-ShrinkPhotonRoomWhenClosed = true
+MaxPlayers = 8            # lobby capacity, host controls the room (1-255)
 
 [Diagnostics]
-VerboseLogging = true
+ForceSyncTargetToZero = true    # lets loading finish with 5+ players
+ForceMinPlayerInstances = 0     # solo-testing only; keep 0 in real multiplayer
+SelfTestPhotonRealloc = false   # set true for the headless -autotest, then back to false
 ```
 
-The shrink option follows the same idea used by the R.E.P.O. MorePlayers mod: allow a larger lobby before the run starts, then when the host closes the Photon room, reduce `CurrentRoom.MaxPlayers` to the actual connected player count. This is meant to avoid loading flows that wait for empty player slots.
+> **Every player in a session must run the same DLL build.** Mixed versions produce
+> baffling desync bugs. Only the host's `MaxPlayers` matters for the room cap.
 
-## Build on Windows
+## Friend pack
 
-1. Install the .NET SDK.
+`pack\` (or the prebuilt `SupermarketMorePlayers-FriendPack.zip`) contains the full
+runtime needed by friends: `BepInEx\core|interop|unity-libs|plugins|config`,
+`dotnet\`, `winhttp.dll`, `doorstop_config.ini`, `.doorstop_version`.
+Extract over the game folder, then launch. See `README-INSTALL.txt` in the pack.
 
-   Check it from PowerShell:
+## Repo contents
 
-   ```powershell
-   dotnet --version
-   ```
-
-2. Install BepInEx 6 IL2CPP into the Supermarket Simulator game folder.
-
-   The folder should look like this:
-
-   ```text
-   Supermarket Simulator/
-     BepInEx/
-       core/
-     Supermarket Simulator.exe
-     GameAssembly.dll
-     Supermarket Simulator_Data/
-   ```
-
-3. Launch the game once with BepInEx installed.
-
-   This is required because BepInEx generates the interop assemblies the mod builds against:
-
-   ```text
-   BepInEx/interop/
-   ```
-
-4. Build the mod from this source folder:
-
-   ```powershell
-   cd "C:\path\to\Supermarket Simulator\MorePlayersBepInEx"
-   dotnet build -c Release
-   ```
-
-   By default, the project expects BepInEx at:
-
-   ```text
-   ..\BepInEx
-   ```
-
-   If your BepInEx folder is somewhere else, pass it explicitly:
-
-   ```powershell
-   dotnet build -c Release -p:BepInExDir="C:\path\to\Supermarket Simulator\BepInEx"
-   ```
-
-5. Install the built plugin.
-
-   Create this folder if needed:
-
-   ```text
-   BepInEx\plugins\SupermarketMorePlayers\
-   ```
-
-   Then copy:
-
-   ```text
-   MorePlayersBepInEx\bin\Release\net6.0\SupermarketMorePlayers.dll
-   ```
-
-   into:
-
-   ```text
-   BepInEx\plugins\SupermarketMorePlayers\SupermarketMorePlayers.dll
-   ```
-
-6. Start the game and edit the generated config after the first successful load:
-
-```powershell
-notepad "BepInEx\config\dev.codex.supermarket.moreplayers.cfg"
 ```
-
-Start with `MaxPlayers = 5` for the first test.
-
-## Test plan
-
-Start with `MaxPlayers = 5`, then test 6 and 8. Watch the BepInEx log for:
-
-- Patched Photon room creation methods.
-- Patched Steamworks lobby creation methods.
-- `LobbyManager.m_MaxPlayersPerRoom forced`.
-- `CurrentRoom: PlayerCount=..., MaxPlayers=..., IsOpen=...`.
-- `Room closed; Photon CurrentRoom.MaxPlayers shrunk`.
-
-If a fifth player can enter but loading or spawning breaks, the next likely fixes are in `NetworkManager`, `PlayerManager.GetAvailableSkinIndex`, spawn positions, and `RoomSettingsManager` UI assumptions.
+Plugin.cs                  # the entire mod (single source file)
+MorePlayersBepInEx.csproj  # builds SupermarketMorePlayers.dll (follows upstream file name)
+build.ps1                  # optional convenience build invoker
+scripts/AutoTest.ps1       # headless -autotest launcher + verdict parser
+```

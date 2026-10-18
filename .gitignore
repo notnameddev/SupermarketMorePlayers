@@ -1,7 +1,11 @@
+build/
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.iml
 bin/
 obj/
-.vs/
-.vscode/
-*.user
-*.suo
-*.nupkg
+# Internal working notes may contain personal paths; never commit.
+docs/
